@@ -7,3 +7,5 @@ export 'models/ergblemanager.dart';
 export 'models/ergometer.dart';
 export 'enums.dart';
 export 'data/workoutsummary.dart';
+export 'data/generalstatus.dart';
+export 'data/strokedata.dart';
