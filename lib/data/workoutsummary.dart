@@ -36,7 +36,9 @@ class WorkoutSummary extends TimestampedData {
   int minHeartRate;
   int maxHeartRate;
   int avgDragFactor;
-  late int recoveryHeartRate;
+  /// Null until the PM5 re-sends the summary about a minute after the piece, since 0 is not a
+  /// valid value here according to the spec.
+  int? recoveryHeartRate;
   WorkoutType workoutType;
   double avgPace;
 
@@ -58,14 +60,23 @@ class WorkoutSummary extends TimestampedData {
         avgPace = CsafeIntExtension.fromBytes(data.sublist(18, 20),
                 endian: Endian.little) /
             10,
-        super.fromBytes(data) {
-    //recovery heart rate here
-    int recHRVal = data.elementAt(16);
-    // 0 is not a valid value here according to the spec
-    if (recHRVal > 0) {
-      recoveryHeartRate = recHRVal;
-    }
-  }
+        recoveryHeartRate = data.elementAt(16) > 0 ? data.elementAt(16) : null,
+        super.fromBytes(data);
+
+  Map<String, Object?> toDataMap() => {
+        "summary.log_timestamp": timestamp,
+        "summary.work_time": workTime,
+        "summary.work_distance": workDistance,
+        "summary.average_stroke_rate": avgSPM,
+        "summary.end_heart_rate": endHeartRate,
+        "summary.average_heart_rate": avgHeartRate,
+        "summary.min_heart_rate": minHeartRate,
+        "summary.max_heart_rate": maxHeartRate,
+        "summary.average_drag_factor": avgDragFactor,
+        "summary.recovery_heart_rate": recoveryHeartRate,
+        "summary.workout_type": workoutType.name,
+        "summary.average_pace": avgPace,
+      };
 
   @override
   String toString() => "WorkoutSummary ("
@@ -109,4 +120,15 @@ class WorkoutSummary2 extends TimestampedData {
         avgCalories = CsafeIntExtension.fromBytes(data.sublist(17, 19),
             endian: Endian.little),
         super.fromBytes(data);
+
+  Map<String, Object?> toDataMap() => {
+        "summary.interval_type": intervalType.name,
+        "summary.interval_size": intervalSize,
+        "summary.interval_count": intervalCount,
+        "summary.total_calories": totalCalories,
+        "summary.watts": watts,
+        "summary.total_rest_distance": totalRestDistance,
+        "summary.interval_rest_time": intervalRestTime,
+        "summary.average_calories": avgCalories,
+      };
 }

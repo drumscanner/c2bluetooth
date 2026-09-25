@@ -13,38 +13,9 @@ import 'package:rxdart/rxdart.dart';
 
 enum ErgometerConnectionState { connecting, connected, disconnected }
 
-/// Which BLE characteristic a given [Ergometer.monitorForData] key is sourced from.
-enum _ErgDataSource { generalStatus, strokeData, additionalStrokeData }
-
-/// Maps every data key supported by [Ergometer.monitorForData] to the characteristic that
-/// provides it. See [GeneralStatus.toDataMap], [StrokeData.toDataMap], and
-/// [AdditionalStrokeData.toDataMap] for where these keys are produced.
-const Map<String, _ErgDataSource> _dataKeySources = {
-  "general.elapsed_time": _ErgDataSource.generalStatus,
-  "general.distance": _ErgDataSource.generalStatus,
-  "general.workout_type": _ErgDataSource.generalStatus,
-  "general.interval_type": _ErgDataSource.generalStatus,
-  "general.workout_state": _ErgDataSource.generalStatus,
-  "general.rowing_state": _ErgDataSource.generalStatus,
-  "general.stroke_state": _ErgDataSource.generalStatus,
-  "general.total_work_distance": _ErgDataSource.generalStatus,
-  "general.workout_duration": _ErgDataSource.generalStatus,
-  "general.drag_factor": _ErgDataSource.generalStatus,
-  "stroke.elapsed_time": _ErgDataSource.strokeData,
-  "stroke.distance": _ErgDataSource.strokeData,
-  "stroke.drive_length": _ErgDataSource.strokeData,
-  "stroke.drive_time": _ErgDataSource.strokeData,
-  "stroke.recovery_time": _ErgDataSource.strokeData,
-  "stroke.distance_per_stroke": _ErgDataSource.strokeData,
-  "stroke.drive_force.max": _ErgDataSource.strokeData,
-  "stroke.drive_force.average": _ErgDataSource.strokeData,
-  "stroke.work_per_stroke": _ErgDataSource.strokeData,
-  "stroke.count": _ErgDataSource.strokeData,
-  "stroke.power": _ErgDataSource.additionalStrokeData,
-  "stroke.calories": _ErgDataSource.additionalStrokeData,
-  "stroke.projected_work_time": _ErgDataSource.additionalStrokeData,
-  "stroke.projected_work_distance": _ErgDataSource.additionalStrokeData,
-};
+/// Turns one notification's bytes into named data fields, or null if it doesn't complete a
+/// data point on its own (e.g. a force curve packet that isn't the curve's last).
+typedef _DataParser = Map<String, Object?>? Function(Uint8List bytes);
 
 class Ergometer {
   final BluetoothDevice _device;
@@ -54,6 +25,12 @@ class Ergometer {
   // start monitoring characteristics right away (without awaiting connectAndDiscover first, e.g.
   // from a widget's build method) wait for discovery instead of racing it.
   Completer<void> _discoveryComplete = Completer<void>();
+
+  // Every parsed notification from every data characteristic flows through this one stream, so
+  // each characteristic is subscribed to exactly once no matter how many listeners there are.
+  final StreamController<Map<String, Object?>> _dataHub =
+      StreamController<Map<String, Object?>>.broadcast();
+  final List<StreamSubscription<List<int>>> _dataHubSubscriptions = [];
 
   /// Get the name of this erg. i.e. "PM5" + serial number
   ///
@@ -83,11 +60,96 @@ class Ergometer {
 
     _csafeClient = Csafe(_readCsafe, _writeCsafe);
     _discoveryComplete.complete();
+    await _startDataHub();
   }
 
   /// Disconnect from this erg or cancel the connection
   Future<void> disconnectOrCancel() async {
+    await _stopDataHub();
     return _device.disconnect();
+  }
+
+  /// Sets how often the PM5 sends its status notifications. The PM5 defaults to
+  /// [ErgSampleRate.ms500] each time it connects.
+  Future<void> setSampleRate(ErgSampleRate rate) async {
+    await _discoveryComplete.future;
+    BluetoothCharacteristic? characteristic = _tryFindCharacteristic(
+        Identifiers.C2_ROWING_PRIMARY_SERVICE_UUID,
+        Identifiers.C2_ROWING_SAMPLE_RATE_CHARACTERISTIC_UUID);
+    await characteristic?.write([rate.value]);
+  }
+
+  /// The parser for each data characteristic in the rowing service. Built per connection since
+  /// the force curve assemblers carry state between packets.
+  Map<String, _DataParser> _createDataParsers() {
+    ForceCurveAssembler forceCurve = ForceCurveAssembler();
+    ForceCurveAssembler forceCurve2 = ForceCurveAssembler();
+    return {
+      Identifiers.C2_ROWING_GENERAL_STATUS_CHARACTERISTIC_UUID: (bytes) =>
+          GeneralStatus.fromBytes(bytes).toDataMap(),
+      Identifiers.C2_ROWING_ADDITIONAL_STATUS1_CHARACTERISTIC_UUID: (bytes) =>
+          AdditionalStatus1.fromBytes(bytes).toDataMap(),
+      Identifiers.C2_ROWING_ADDITIONAL_STATUS2_CHARACTERISTIC_UUID: (bytes) =>
+          AdditionalStatus2.fromBytes(bytes).toDataMap(),
+      Identifiers.C2_ROWING_STROKE_DATA_CHARACTERISTIC_UUID: (bytes) =>
+          StrokeData.fromBytes(bytes).toDataMap(),
+      Identifiers.C2_ROWING_ADDITIONAL_STROKE_DATA_CHARACTERISTIC_UUID:
+          (bytes) => AdditionalStrokeData.fromBytes(bytes).toDataMap(),
+      Identifiers.C2_ROWING_SPLIT_INTERVAL_DATA_CHARACTERISTIC_UUID: (bytes) =>
+          SplitIntervalData.fromBytes(bytes).toDataMap(),
+      Identifiers.C2_ROWING_SPLIT_INTERVAL_DATA_CHARACTERISTIC2_UUID: (bytes) =>
+          AdditionalSplitIntervalData.fromBytes(bytes).toDataMap(),
+      Identifiers.C2_ROWING_END_OF_WORKOUT_SUMMARY_CHARACTERISTIC_UUID:
+          (bytes) => WorkoutSummary.fromBytes(bytes).toDataMap(),
+      Identifiers.C2_ROWING_END_OF_WORKOUT_SUMMARY_CHARACTERISTIC2_UUID:
+          (bytes) => WorkoutSummary2.fromBytes(bytes).toDataMap(),
+      Identifiers.C2_ROWING_HEART_RATE_BELT_INFO_CHARACTERISTIC_UUID: (bytes) =>
+          HeartRateBeltInfo.fromBytes(bytes).toDataMap(),
+      Identifiers.C2_ROWING_ADDITIONAL_STATUS3_CHARACTERISTIC_UUID: (bytes) =>
+          AdditionalStatus3.fromBytes(bytes).toDataMap(),
+      Identifiers.C2_ROWING_FORCE_CURVE_CHARACTERISTIC_UUID: (bytes) {
+        List<int>? curve = forceCurve.add(bytes);
+        return curve == null ? null : {"force_curve.points": curve};
+      },
+      Identifiers.C2_ROWING_FORCE_CURVE2_CHARACTERISTIC_UUID: (bytes) {
+        List<int>? curve = forceCurve2.add(bytes);
+        return curve == null ? null : {"force_curve_v2.points": curve};
+      },
+    };
+  }
+
+  /// Subscribes to every data characteristic this PM5's firmware has, feeding [_dataHub].
+  Future<void> _startDataHub() async {
+    await _stopDataHub();
+
+    for (MapEntry<String, _DataParser> entry in _createDataParsers().entries) {
+      BluetoothCharacteristic? characteristic = _tryFindCharacteristic(
+          Identifiers.C2_ROWING_PRIMARY_SERVICE_UUID, entry.key);
+      if (characteristic == null || !characteristic.properties.notify) {
+        continue;
+      }
+
+      _dataHubSubscriptions.add(characteristic.onValueReceived.listen((bytes) {
+        // Payload lengths vary across firmware revisions; a packet too short for its parser
+        // is dropped rather than erroring the stream every listener shares.
+        try {
+          Map<String, Object?>? data = entry.value(Uint8List.fromList(bytes));
+          if (data != null) {
+            _dataHub.add(data);
+          }
+        } on RangeError {
+          return;
+        }
+      }));
+      await characteristic.setNotifyValue(true);
+    }
+  }
+
+  Future<void> _stopDataHub() async {
+    for (StreamSubscription<List<int>> subscription in _dataHubSubscriptions) {
+      await subscription.cancel();
+    }
+    _dataHubSubscriptions.clear();
   }
 
   /// Returns a stream of [WorkoutSummary] objects upon completion of any programmed piece or a "just row" piece that is longer than 1 minute.
@@ -107,41 +169,18 @@ class Ergometer {
     });
   }
 
-  /// Returns a stream of live data from the erg, restricted to the fields named in [dataKeys].
+  /// Returns a stream of every data field the erg reports, from every data characteristic in
+  /// the rowing service (see [_createDataParsers]). Each emitted [Map] holds the fields of one
+  /// notification, keyed by dotted names like "general.distance", "status1.heart_rate",
+  /// "split.power" or "force_curve.points".
   ///
-  /// Each emitted [Map] carries every field from whichever underlying BLE characteristic just
-  /// updated, keyed by dotted names such as "general.distance" or "stroke.power" - not only the
-  /// keys that were asked for. Only characteristics needed to cover [dataKeys] are subscribed
-  /// to. See [_dataKeySources] for the full list of supported keys.
-  Stream<Map<String, Object?>> monitorForData(Set<String> dataKeys) {
-    Set<_ErgDataSource> sources = dataKeys
-        .map((key) => _dataKeySources[key])
-        .whereType<_ErgDataSource>()
-        .toSet();
+  /// Data flows from the moment [connectAndDiscover] completes, whether or not anyone listens.
+  Stream<Map<String, Object?>> monitorAllData() => _dataHub.stream;
 
-    List<Stream<Map<String, Object?>>> streams = [];
-
-    if (sources.contains(_ErgDataSource.generalStatus)) {
-      streams.add(_monitorCharacteristic(
-              Identifiers.C2_ROWING_PRIMARY_SERVICE_UUID,
-              Identifiers.C2_ROWING_GENERAL_STATUS_CHARACTERISTIC_UUID)
-          .map((bytes) => GeneralStatus.fromBytes(bytes).toDataMap()));
-    }
-    if (sources.contains(_ErgDataSource.strokeData)) {
-      streams.add(_monitorCharacteristic(
-              Identifiers.C2_ROWING_PRIMARY_SERVICE_UUID,
-              Identifiers.C2_ROWING_STROKE_DATA_CHARACTERISTIC_UUID)
-          .map((bytes) => StrokeData.fromBytes(bytes).toDataMap()));
-    }
-    if (sources.contains(_ErgDataSource.additionalStrokeData)) {
-      streams.add(_monitorCharacteristic(
-              Identifiers.C2_ROWING_PRIMARY_SERVICE_UUID,
-              Identifiers.C2_ROWING_ADDITIONAL_STROKE_DATA_CHARACTERISTIC_UUID)
-          .map((bytes) => AdditionalStrokeData.fromBytes(bytes).toDataMap()));
-    }
-
-    return Rx.merge(streams);
-  }
+  /// Like [monitorAllData], restricted to notifications that carry at least one of [dataKeys].
+  /// Each emitted [Map] still holds every field of that notification, not only the ones asked for.
+  Stream<Map<String, Object?>> monitorForData(Set<String> dataKeys) =>
+      _dataHub.stream.where((data) => data.keys.any(dataKeys.contains));
 
   /// Finds a characteristic among the services discovered by [connectAndDiscover] and streams
   /// its notified values. Enables notifications on first subscription.
@@ -157,14 +196,21 @@ class Ergometer {
       String serviceUuid, String characteristicUuid) async* {
     await _discoveryComplete.future;
     BluetoothCharacteristic characteristic =
-        await _findCharacteristic(serviceUuid, characteristicUuid);
+        _findCharacteristic(serviceUuid, characteristicUuid);
     await characteristic.setNotifyValue(true);
     yield* characteristic.onValueReceived
         .map((bytes) => Uint8List.fromList(bytes));
   }
 
-  Future<BluetoothCharacteristic> _findCharacteristic(
-      String serviceUuid, String characteristicUuid) async {
+  BluetoothCharacteristic _findCharacteristic(
+          String serviceUuid, String characteristicUuid) =>
+      _tryFindCharacteristic(serviceUuid, characteristicUuid) ??
+      (throw StateError(
+          "Characteristic $characteristicUuid not found in service $serviceUuid"));
+
+  /// Returns null when this PM5's firmware doesn't have the characteristic.
+  BluetoothCharacteristic? _tryFindCharacteristic(
+      String serviceUuid, String characteristicUuid) {
     Guid serviceGuid = Guid(serviceUuid);
     Guid characteristicGuid = Guid(characteristicUuid);
 
@@ -175,11 +221,17 @@ class Ergometer {
         .expand((service) => [service, ...service.includedServices])
         .toList();
 
-    BluetoothService service =
-        allServices.firstWhere((service) => service.uuid == serviceGuid);
-
-    return service.characteristics
-        .firstWhere((characteristic) => characteristic.uuid == characteristicGuid);
+    for (BluetoothService service in allServices) {
+      if (service.uuid != serviceGuid) {
+        continue;
+      }
+      for (BluetoothCharacteristic characteristic in service.characteristics) {
+        if (characteristic.uuid == characteristicGuid) {
+          return characteristic;
+        }
+      }
+    }
+    return null;
   }
 
   /// Expose a stream of events to enable monitoring the erg's connection state
@@ -207,7 +259,7 @@ class Ergometer {
   ///
   /// Intended for passing to the csafe_fitness library to allow it to write data to the erg
   Future<void> _writeCsafe(Uint8List value) async {
-    BluetoothCharacteristic characteristic = await _findCharacteristic(
+    BluetoothCharacteristic characteristic = _findCharacteristic(
         Identifiers.C2_ROWING_CONTROL_SERVICE_UUID,
         Identifiers.C2_ROWING_PM_RECEIVE_CHARACTERISTIC_UUID);
     await characteristic.write(value, withoutResponse: true);

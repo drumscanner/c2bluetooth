@@ -391,3 +391,19 @@ extension WorkoutScreenValueExtension on WorkoutScreenValue {
   static WorkoutScreenValue fromInt(int i) =>
       _racingScreenValues.map((key, value) => MapEntry(value, key))[i];
 }
+
+/// How often the PM5 sends its status notifications (General Status, Additional Status 1-3).
+///
+/// Written to the Sample Rate characteristic (0xCE060034); the PM5's default is [ms500].
+enum ErgSampleRate { s1, ms500, ms250, ms100 }
+
+extension ErgSampleRateExtension on ErgSampleRate {
+  int get value => this.index;
+
+  Duration get interval => const [
+        Duration(seconds: 1),
+        Duration(milliseconds: 500),
+        Duration(milliseconds: 250),
+        Duration(milliseconds: 100),
+      ][this.index];
+}

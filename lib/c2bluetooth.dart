@@ -9,3 +9,7 @@ export 'enums.dart';
 export 'data/workoutsummary.dart';
 export 'data/generalstatus.dart';
 export 'data/strokedata.dart';
+export 'data/additionalstatus.dart';
+export 'data/splitinterval.dart';
+export 'data/heartratebelt.dart';
+export 'data/forcecurve.dart';
