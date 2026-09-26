@@ -302,6 +302,15 @@ class Ergometer {
         .sendCommands([cmdGoInUse]).then((value) => print(value));
   }
 
+  /// Sends the CSAFE GOIDLE -> GOHAVEID -> GOINUSE sequence, the standard handshake that starts
+  /// a session and prompts the erg to begin sending live data. Distinct from [configureWorkout],
+  /// which additionally programs a specific goal before this same handshake.
+  Future<void> startWorkoutSession() async {
+    await _csafeClient!.sendCommands([cmdGoIdle]);
+    await _csafeClient!.sendCommands([cmdGoHaveId]);
+    await _csafeClient!.sendCommands([cmdGoInUse]);
+  }
+
   /// Program a workout into the PM with particular parameters
   ///
   ///Currently only the more basic of workout types are supported, such as basic single intervals, single distance, and single time pieces

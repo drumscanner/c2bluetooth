@@ -123,3 +123,9 @@ class CsafeCmdSetTimeGoal extends CsafeCmdSetTime {
         shouldThrow: true);
   }
 }
+
+/// Go to HaveID state.
+///
+/// csafe_fitness defines cmdGoIdle/cmdGoInUse as top-level constants but its cmdGoHaveID lives
+/// inside a class that's entirely commented out, so it isn't usable as-is - defined here instead.
+CsafeCommand cmdGoHaveId = CsafeCommand.short(0x83);
